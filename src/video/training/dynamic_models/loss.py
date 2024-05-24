@@ -71,12 +71,19 @@ class VALoss(nn.Module):
         """Computes VA loss
 
         Args:
-            x (Tensor): input tensor with shapes (n, 2); 0 - valence, 1 - arousal
-            y (Tensor): target tensor with shapes (n, 2); 0 - valence, 1 - arousal
+            x (Tensor): input tensor with shapes (batch_size, n, 2); 0 - valence, 1 - arousal
+            y (Tensor): target tensor with shapes (batch_size, n, 2); 0 - valence, 1 - arousal
 
         Returns:
             Tensor: VA loss value
         """
+        #losses = [self.alpha * self.ccc(x[i, :, 0], y[i, :, 0]) + self.beta * self.ccc(x[i, :, 1], y[i, :, 1]) for i in
+        #          range(x.size(0))]
+        #loss = torch.mean(torch.stack(losses))
+        # resize x to (batch_size * n, 2) and y to (batch_size * n, 2)
+        x = x.view(-1, 2)
+        y = y.view(-1, 2)
+        #loss = self.alpha * self.ccc(x[:, :, 0], y[:, :, 0]) + self.beta * self.ccc(x[:, :, 1], y[:, :, 1])
         loss = self.alpha * self.ccc(x[:, 0], y[:, 0]) + self.beta * self.ccc(x[:, 1], y[:, 1])
         return loss
 
@@ -99,10 +106,4 @@ class SoftFocalLossForSequence(nn.Module):
 
     def forward(self, x: Tensor, y: Tensor) -> Tensor:
         # x and y have the shape (batch, timesteps, num_classes)
-        # calculate the loss for each timestep
-        loss = torch.stack([self.timestep_focal_loss(x[:, i, :], y[:, i, :]) for i in range(x.shape[1])])
-        if self.aggregation == 'mean':
-            return loss.mean()
-        elif self.aggregation == 'sum':
-            return loss.sum()
-        return loss
+        return self.timestep_focal_loss(x, y)

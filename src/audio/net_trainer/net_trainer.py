@@ -1,7 +1,6 @@
 import os
 import logging
 from enum import Enum
-from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -11,9 +10,9 @@ import torch
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 
-from utils.accuracy_utils import conf_matrix
-from visualization.visualize import plot_conf_matrix
-from utils.common_utils import create_logger
+from audio.utils.accuracy_utils import conf_matrix
+from audio.visualization.visualize import plot_conf_matrix
+from audio.utils.common_utils import create_logger
 
 
 class ProblemType(Enum):
@@ -40,7 +39,7 @@ class NetTrainer:
             log_root (str): Directory for logging
             experiment_name (str): Name of experiments for logging
             c_names (list[str]): Class names to calculate the confusion matrix 
-            metrics (list[Callable]): List of performance measures based on the best results of which the model will be saved. 
+            metrics (list[callable]): List of performance measures based on the best results of which the model will be saved. 
                                       The first measure (0) in the list will be used for this, the others provide 
                                       additional information
             device (torch.device): Device where the model will be trained
@@ -56,7 +55,7 @@ class NetTrainer:
                  log_root: str, 
                  experiment_name: str,
                  c_names: list[str], 
-                 metrics: list[Callable], 
+                 metrics: list[callable], 
                  device: torch.device, 
                  problem_type: ProblemType = ProblemType.CLASSIFICATION,
                  group_predicts_fn: callable = None, 
@@ -188,7 +187,14 @@ class NetTrainer:
                     'Epoch: {}. {}. Loss: {:.4f}, Performance:'.format(epoch, 
                                                                        phase.capitalize(), 
                                                                        epoch_loss))
-                performance = self.calc_metrics(targets, predicts, verbose=verbose)
+                if self.problem_type == ProblemType.CLASSIFICATION:
+                    performance = self.calc_metrics(np.hstack(targets), 
+                                                    np.asarray(predicts).reshape(-1, len(self.c_names)), 
+                                                    verbose=verbose)
+                else:
+                    performance = self.calc_metrics(np.stack(targets), 
+                                                    np.stack(predicts), 
+                                                    verbose=verbose)
                 
                 d_epoch_stats['{}_loss'.format(phase)] = epoch_loss
                 summary[phase].add_scalar('loss', epoch_loss, epoch)
@@ -208,7 +214,9 @@ class NetTrainer:
                         max_perf[phase]['epoch'] = epoch
                     
                     if self.problem_type == ProblemType.CLASSIFICATION:
-                        cm = conf_matrix(targets, predicts, [i for i in range(len(self.c_names))])
+                        cm = conf_matrix(np.hstack(targets), 
+                                         np.asarray(predicts).reshape(-1, len(self.c_names)), 
+                                         [i for i in range(len(self.c_names))])
                         res_name = 'epoch_{0}_{1}_{2}'.format(epoch, phase, epoch_score)
                         plot_conf_matrix(cm, 
                                          labels=self.c_names_to_display if self.c_names_to_display else self.c_names,
@@ -228,8 +236,10 @@ class NetTrainer:
                     model.to(self.device)
                 
                 if self.problem_type == ProblemType.CLASSIFICATION:
-                    if ('devel' in phase) and (epoch == max_perf['devel']['epoch']) and ('test' in phase):
-                        cm = conf_matrix(targets, predicts, [i for i in range(len(self.c_names))])
+                    if os.path.exists(os.path.join(self.logging_paths['model_path'], 'epoch_{0}.pth'.format(epoch))):
+                        cm = conf_matrix(np.hstack(targets), 
+                                         np.asarray(predicts).reshape(-1, len(self.c_names)), 
+                                         [i for i in range(len(self.c_names))])
                         res_name = 'epoch_{0}_{1}_{2}'.format(epoch, phase, epoch_score)
                         plot_conf_matrix(cm,
                                          labels=self.c_names_to_display if self.c_names_to_display else self.c_names,
@@ -300,15 +310,22 @@ class NetTrainer:
         for idx, data in enumerate(tqdm(dataloader, disable=not verbose)):
             inps, labs, s_info = data
             if isinstance(inps, list):
-                inps = [ d.to(self.device) for d in inps ]
+                inps = [d.to(self.device) for d in inps]
             else:
                 inps = inps.to(self.device)
 
-            labs = labs.to(self.device)
+            if isinstance(labs, list):
+                labs = [d.to(self.device) for d in labs]
+            else:
+                labs = labs.to(self.device)
             
-            has_labels = torch.all(labs != -1)
+            if self.problem_type == ProblemType.CLASSIFICATION:
+                has_labels = torch.all(labs != -1)
+            else:
+                has_labels = True
+            
             if (mixup_alpha) and ('train' in phase):
-                inps, labs = self.mixup_data(inps, labs, alpha=mixup_alpha)
+                inps, labs = self.mixup_data(inps, labs.flatten(), alpha=mixup_alpha)
             
             self.optimizer.zero_grad()
 
@@ -316,25 +333,38 @@ class NetTrainer:
             preds = None
             with torch.set_grad_enabled('train' in phase):
                 preds = self.model(inps)
-                if has_labels:
-                    loss_value = self.loss(preds, labs)
+                if self.loss:
+                    if self.problem_type == ProblemType.CLASSIFICATION:
+                        loss_value = self.loss(preds.reshape(-1, len(self.c_names)), labs.flatten())
+                    else:
+                        loss_value = self.loss(preds.reshape(-1, 2), labs.reshape(-1, 2)) 
 
                 # backward + optimize only if in training phase
-                if ('train' in phase) and has_labels:
+                if ('train' in phase) and has_labels and self.loss:
                     loss_value.backward()
                     self.optimizer.step()
                     if self.optimizer:
                         self.scheduler.step(epoch + idx / iters)
 
             # statistics
-            if has_labels:
+            if has_labels and self.loss:
                 running_loss += loss_value.item() * dataloader.batch_size
             
-            targets.extend(labs.cpu().numpy())
+            if isinstance(labs, list):
+                labs = [d.cpu().numpy() for d in labs]
+            else:
+                labs = labs.cpu().numpy()
+                
+            targets.extend(labs)
             if self.problem_type == ProblemType.CLASSIFICATION:
-                preds = F.softmax(preds, dim=1)
+                preds = F.softmax(preds, dim=-1)
+                
+            if isinstance(preds, list):
+                preds = [d.cpu().detach().numpy() for d in preds]
+            else:
+                preds = preds.cpu().detach().numpy()
 
-            predicts.extend(preds.cpu().detach().numpy())
+            predicts.extend(preds)
             sample_info.extend(s_info)
 
         epoch_loss = running_loss / iters if has_labels else 0
@@ -346,6 +376,72 @@ class NetTrainer:
        
         return targets, predicts, sample_info, epoch_loss
     
+    def extract_features(self, 
+                         phase: str, 
+                         dataloader: torch.utils.data.dataloader.DataLoader, 
+                         verbose: bool = True) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[dict]]:
+        """Loop for feature exctraction
+        - Applies softmax funstion on predicts if `problem_type` is ProblemType.CLASSIFICATION
+
+        Args:
+            phase (str): Name of phase: could be train, devel(valid), test
+            dataloader (torch.utils.data.dataloader.DataLoader): Dataloader of phase
+            verbose (bool, optional): Detailed output with tqdm. Defaults to True.
+
+        Returns:
+            tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], list[dict]]: targets, 
+                                                                                     predicts, 
+                                                                                     features,
+                                                                                     sample_info
+        """
+        targets = []
+        predicts = []
+        features = []
+        sample_info = []
+        
+        self.model.eval()
+        
+        # Iterate over data.
+        for idx, data in enumerate(tqdm(dataloader, disable=not verbose)):
+            inps, labs, s_info = data
+            if isinstance(inps, list):
+                inps = [d.to(self.device) for d in inps]
+            else:
+                inps = inps.to(self.device)
+
+            if isinstance(labs, list):
+                labs = [d.to(self.device) for d in labs]
+            else:
+                labs = labs.to(self.device)
+
+            # forward and backward
+            preds = None
+            with torch.set_grad_enabled('train' in phase):
+                preds, feats = self.model.get_features(inps)
+            
+            if isinstance(labs, list):
+                labs = [d.cpu().numpy() for d in labs]
+            else:
+                labs = labs.cpu().numpy()
+                
+            targets.extend(labs)
+            if self.problem_type == ProblemType.CLASSIFICATION:
+                preds = F.softmax(preds, dim=-1)
+                
+            if isinstance(preds, list):
+                preds = [d.cpu().detach().numpy() for d in preds]
+            else:
+                preds = preds.cpu().detach().numpy()
+
+            predicts.extend(preds)
+
+            feats = feats.cpu().detach().numpy()
+            features.extend(feats)
+
+            sample_info.extend(s_info)
+       
+        return targets, predicts, features, sample_info
+
     def calc_metrics(self, 
                      targets: list[np.ndarray], 
                      predicts: list[np.ndarray], 

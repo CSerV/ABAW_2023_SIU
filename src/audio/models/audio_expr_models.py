@@ -1,6 +1,6 @@
 import sys
 
-sys.path.append('src/audio')
+sys.path.append('src')
 
 import numpy as np
 import torch
@@ -13,7 +13,7 @@ from transformers.models.wav2vec2.modeling_wav2vec2 import (
 )
  
 
-from models.attention_layers import TransformerLayer
+from audio.models.attention_layers import TransformerLayer
 
 
 class ExprModelV1(Wav2Vec2PreTrainedModel):
@@ -34,11 +34,11 @@ class ExprModelV1(Wav2Vec2PreTrainedModel):
  
             torch.nn.Conv1d(self.f_size, self.f_size, kernel_size=3),
             torch.nn.BatchNorm1d(self.f_size),
-            torch.nn.AdaptiveAvgPool1d(1),
+            torch.nn.AdaptiveAvgPool1d(4),
             torch.nn.ReLU(),
         )
  
-        self.feature_downsample = nn.Linear(256, 8)
+        self.feature_downsample = nn.Linear(self.f_size, 8)
  
         self.init_weights()
         self.unfreeze_last_n_blocks(2)
@@ -57,11 +57,11 @@ class ExprModelV1(Wav2Vec2PreTrainedModel):
         outputs = self.wav2vec2(x)
  
         x, h = self.gru(outputs[0])
- 
+
         x = x.permute(0, 2, 1)
         x = self.time_downsample(x)
  
-        x = x.squeeze()
+        x = x.permute(0, 2, 1)
         x = self.feature_downsample(x)
         return x
 
@@ -81,15 +81,15 @@ class ExprModelV2(Wav2Vec2PreTrainedModel):
             torch.nn.BatchNorm1d(self.f_size),
             torch.nn.MaxPool1d(5),
             torch.nn.ReLU(),
-            
+
             torch.nn.Conv1d(self.f_size, self.f_size, kernel_size=3),
             torch.nn.BatchNorm1d(self.f_size),
-            torch.nn.AdaptiveAvgPool1d(1),
+            torch.nn.AdaptiveAvgPool1d(4),
             torch.nn.ReLU(),
         )
-        
+ 
         self.feature_downsample = nn.Linear(self.f_size, 8)
-        
+
         self.init_weights()
         self.unfreeze_last_n_blocks(2)
         
@@ -112,7 +112,7 @@ class ExprModelV2(Wav2Vec2PreTrainedModel):
         x = x.permute(0, 2, 1)
         x = self.time_downsample(x)
         
-        x = x.squeeze()
+        x = x.permute(0, 2, 1)
         x = self.feature_downsample(x)
         return x
     
@@ -127,19 +127,18 @@ class ExprModelV3(Wav2Vec2PreTrainedModel):
         self.tl2 = TransformerLayer(input_dim=1024, num_heads=16, dropout=0.1, positional_encoding=True)
         
         self.f_size = 1024
-        
         self.time_downsample = torch.nn.Sequential(
             torch.nn.Conv1d(self.f_size, self.f_size, kernel_size=5, stride=3, dilation=2),
             torch.nn.BatchNorm1d(self.f_size),
             torch.nn.MaxPool1d(5),
             torch.nn.ReLU(),
-            
+
             torch.nn.Conv1d(self.f_size, self.f_size, kernel_size=3),
             torch.nn.BatchNorm1d(self.f_size),
-            torch.nn.AdaptiveAvgPool1d(1),
+            torch.nn.AdaptiveAvgPool1d(4),
             torch.nn.ReLU(),
         )
-        
+ 
         self.feature_downsample = nn.Linear(self.f_size, 8)
         
         self.init_weights()
@@ -160,6 +159,19 @@ class ExprModelV3(Wav2Vec2PreTrainedModel):
             for param in self.wav2vec2.encoder.layers[-1 * (i + 1)].parameters():
                 param.requires_grad = True
 
+    def get_features(self, x):
+        x = self.wav2vec2(x)[0]
+
+        x = self.tl1(query=x, key=x, value=x)
+        x = self.tl2(query=x, key=x, value=x)
+
+        x = x.permute(0, 2, 1)
+        features = self.time_downsample(x)
+        features = features.permute(0, 2, 1)
+        
+        x = self.feature_downsample(features)
+        return x, features
+
     def forward(self, x):
         x = self.wav2vec2(x)[0]
 
@@ -169,7 +181,7 @@ class ExprModelV3(Wav2Vec2PreTrainedModel):
         x = x.permute(0, 2, 1)
         x = self.time_downsample(x)
         
-        x = x.squeeze()
+        x = x.permute(0, 2, 1)
         x = self.feature_downsample(x)
         return x
 
@@ -188,3 +200,4 @@ if __name__ == "__main__":
 
     res = model(inp_v)
     print(res)
+    print(res.shape)
